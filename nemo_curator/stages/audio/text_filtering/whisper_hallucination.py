@@ -45,6 +45,7 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     _phrases: set[str] = field(default_factory=set, init=False, repr=False)
+    _setup_called: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.common_hall_file:
@@ -69,6 +70,7 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
                 else:
                     phrases.add(line)
         self._phrases = phrases
+        self._setup_called = True
         logger.info(f"WhisperHallucinationStage: loaded {len(phrases)} phrases from {self.common_hall_file}")
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -93,11 +95,19 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
         return False
 
     def _frequent_single_word(self, text: str) -> bool:
-        cleaned = text.strip().replace(".", "").replace("?", "").replace("!", "")
+        cleaned = text.strip().rstrip(".,?!")
         return cleaned in self._phrases
 
     def process(self, task: AudioTask) -> AudioTask:
+        if not self._setup_called:
+            logger.warning(
+                f"WhisperHallucinationStage ({self.name}): setup() was not called before process(). "
+                "Calling setup() now — check that your executor invokes setup() on each worker."
+            )
+            self.setup()
         text = task.data[self.text_key]
+        if not isinstance(text, str):
+            return task
         words = text.split()
         flagged = self._repeated_ngrams(words) or self._long_word(words) or self._frequent_single_word(text)
         if flagged:

@@ -83,6 +83,13 @@ def test_invalid_model_path_raises() -> None:
         stage._resolve_model_path()
 
 
+def test_non_string_text_returns_task_unchanged() -> None:
+    stage = _make_stage("EN", 0.95)
+    task = AudioTask(data={"cleaned_text": None, "skip_me": 0})
+    result = stage.process(task)
+    assert result.data["skip_me"] == 0
+
+
 def test_requires_model_path() -> None:
     with pytest.raises(ValueError, match="model_path is required"):
         FastTextLIDStage(model_path="")

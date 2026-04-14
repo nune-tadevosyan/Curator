@@ -89,6 +89,25 @@ def test_multiple_rules_applied_in_order(tmp_path: Path) -> None:
     assert result.data["cleaned_text"] == "word-word"
 
 
+def test_setup_called_lazily_when_skipped(tmp_path: Path) -> None:
+    rules_path = _write_rules(tmp_path, [{"pattern": "\u2019", "repl": "'"}])
+    stage = RegexSubstitutionStage(regex_params_yaml=rules_path)
+    # Intentionally do NOT call stage.setup() — process() must call it lazily.
+    task = AudioTask(data={"cleaned_text": "it\u2019s fine", "skip_me": 0})
+    result = stage.process(task)
+    assert result.data["cleaned_text"] == "it's fine"
+
+
+def test_non_string_text_returns_task_unchanged(tmp_path: Path) -> None:
+    rules_path = _write_rules(tmp_path, [{"pattern": r"\w+", "repl": ""}])
+    stage = RegexSubstitutionStage(regex_params_yaml=rules_path)
+    stage.setup()
+    task = AudioTask(data={"cleaned_text": None, "skip_me": 0})
+    result = stage.process(task)
+    assert result.data["cleaned_text"] is None
+    assert result.data["skip_me"] == 0
+
+
 def test_requires_regex_params_yaml() -> None:
     with pytest.raises(ValueError, match="regex_params_yaml is required"):
         RegexSubstitutionStage(regex_params_yaml="")

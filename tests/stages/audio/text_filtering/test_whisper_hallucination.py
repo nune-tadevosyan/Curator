@@ -72,6 +72,30 @@ def test_frequent_phrase_strips_punctuation(tmp_path: Path) -> None:
     assert result.data["skip_me"] == 1
 
 
+def test_frequent_phrase_strips_trailing_comma(tmp_path: Path) -> None:
+    stage = _make_stage(tmp_path, ["Thank you"])
+    task = AudioTask(data={"cleaned_text": "Thank you,", "skip_me": 0})
+    result = stage.process(task)
+    assert result.data["skip_me"] == 1
+
+
+def test_setup_called_lazily_when_skipped(tmp_path: Path) -> None:
+    p = tmp_path / "phrases.txt"
+    p.write_text("Thank you\n", encoding="utf-8")
+    stage = WhisperHallucinationStage(common_hall_file=str(p))
+    # Intentionally do NOT call stage.setup() — process() must call it lazily.
+    task = AudioTask(data={"cleaned_text": "Thank you", "skip_me": 0})
+    result = stage.process(task)
+    assert result.data["skip_me"] == 1
+
+
+def test_non_string_text_returns_task_unchanged(tmp_path: Path) -> None:
+    stage = _make_stage(tmp_path, [])
+    task = AudioTask(data={"cleaned_text": None, "skip_me": 0})
+    result = stage.process(task)
+    assert result.data["skip_me"] == 0
+
+
 def test_preserves_existing_skip_me_one(tmp_path: Path) -> None:
     stage = _make_stage(tmp_path, [])
     task = AudioTask(data={"cleaned_text": "the cat sat on the mat", "skip_me": 1})

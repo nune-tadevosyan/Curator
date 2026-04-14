@@ -41,6 +41,7 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
     resources: Resources = field(default_factory=lambda: Resources(cpus=1.0))
 
     _rules: list[dict[str, Any]] = field(default_factory=list, init=False, repr=False)
+    _setup_called: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.regex_params_yaml:
@@ -50,6 +51,7 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
     def setup(self, worker_metadata: Any = None) -> None:
         with open(self.regex_params_yaml, encoding="utf-8") as f:
             self._rules = yaml.safe_load(f)
+        self._setup_called = True
         logger.info(f"RegexSubstitutionStage: loaded {len(self._rules)} rules from {self.regex_params_yaml}")
 
     def inputs(self) -> tuple[list[str], list[str]]:
@@ -59,7 +61,16 @@ class RegexSubstitutionStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.text_key, self.skip_me_key]
 
     def process(self, task: AudioTask) -> AudioTask:
-        text = " " + task.data[self.text_key] + " "
+        if not self._setup_called:
+            logger.warning(
+                f"RegexSubstitutionStage ({self.name}): setup() was not called before process(). "
+                "Calling setup() now — check that your executor invokes setup() on each worker."
+            )
+            self.setup()
+        text = task.data[self.text_key]
+        if not isinstance(text, str):
+            return task
+        text = " " + text + " "
         for rule in self._rules:
             text = re.sub(rule["pattern"], rule["repl"], text, count=rule.get("count", 0))
         text = re.sub(r"\s+", " ", text).strip()

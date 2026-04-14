@@ -91,7 +91,16 @@ class FastTextLIDStage(ProcessingStage[AudioTask, AudioTask]):
         return [], [self.skip_me_key]
 
     def process(self, task: AudioTask) -> AudioTask:
-        text = task.data[self.text_key].strip().replace("\n", " ")
+        if self._lid is None:
+            logger.warning(
+                f"FastTextLIDStage ({self.name}): setup() was not called before process(). "
+                "Calling setup() now — check that your executor invokes setup() on each worker."
+            )
+            self.setup()
+        text = task.data[self.text_key]
+        if not isinstance(text, str):
+            return task
+        text = text.strip().replace("\n", " ")
         if not text:
             task.data[self.skip_me_key] = 1
             return task
