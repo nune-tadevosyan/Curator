@@ -14,40 +14,37 @@
 
 """Granary v2 ASR postprocessing pipeline.
 
-Reads ALM JSONL manifests, applies text cleaning and filtering, and writes
-filtered output manifests mirroring the input directory structure.
+Recursively finds all *.jsonl manifests under an input directory, applies text
+cleaning and filtering, and writes output manifests mirroring the same
+subdirectory structure under output_dir.
 
 Pipeline stages (per manifest):
-  1. ALMManifestReader      — read JSONL manifest → one AudioTask per line
-  2. InitializeFieldsStage  — copy pred_text → cleaned_text; skip_me = 0
-  3. RegexSubstitutionStage — apply regex normalization rules to cleaned_text
-  4. WhisperHallucinationStage — flag Whisper hallucination patterns
-  5. FastTextLIDStage        — flag non-English or low-confidence transcriptions
-  6. FinalizeFieldsStage     — text → v1_text; cleaned_text → text; drop pnc/itn/timestamp
-  7. PreserveByValueStage    — drop entries where skip_me != 0
-  8. ALMManifestWriterStage  — write surviving entries to mirrored output path
+  1. ALMManifestReader         — read JSONL manifest → one AudioTask per line
+  2. InitializeFieldsStage     — copy pred_text → cleaned_text; skip_me = 0
+  3. RegexSubstitutionStage    — apply regex normalization rules to cleaned_text
+  4. WhisperHallucinationStage — flag Whisper hallucination patterns (sets skip_me=1)
+  5. FastTextLIDStage          — flag non-English or low-confidence transcriptions (sets skip_me=1)
+  6. FinalizeFieldsStage       — text → v1_text; cleaned_text → text; drop pnc/itn/timestamp
+  7. ALMManifestWriterStage    — write all entries (including flagged) to mirrored output path
 
 Usage::
 
     python tutorials/audio/granary_v2_postprocessing/pipeline.py \\
-        --input_config /path/to/data_config.yaml \\
+        --input_dir /path/to/results_dir \\
         --output_dir /path/to/output_root \\
         --fasttext_model lid.176.ftz
 """
 
 import argparse
-import os
 import sys
 from pathlib import Path
 
-import yaml
 from loguru import logger
 
 from nemo_curator.backends.xenna import XennaExecutor
 from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.audio.alm.alm_manifest_reader import ALMManifestReader
 from nemo_curator.stages.audio.alm.alm_manifest_writer import ALMManifestWriterStage
-from nemo_curator.stages.audio.common import PreserveByValueStage
 from nemo_curator.stages.audio.text_filtering import (
     FastTextLIDStage,
     FinalizeFieldsStage,
@@ -61,33 +58,23 @@ _DEFAULT_REGEX_YAML = str(_TUTORIAL_DIR / "common.yaml")
 _DEFAULT_HALL_PHRASES = str(_TUTORIAL_DIR / "en.txt")
 
 
-def _compute_output_paths(manifest_paths: list[str], output_dir: str) -> dict[str, str]:
-    """Mirror each input manifest path into output_dir, preserving relative structure.
+def _find_manifests(input_dir: str) -> list[str]:
+    """Return all *.jsonl files found recursively under input_dir, sorted."""
+    return sorted(str(p) for p in Path(input_dir).rglob("*.jsonl"))
 
-    The common ancestor of all input manifests is stripped and the remainder
-    is re-rooted under output_dir. For a single manifest the filename is
-    preserved directly under output_dir.
+
+def _compute_output_paths(manifest_paths: list[str], input_dir: str, output_dir: str) -> dict[str, str]:
+    """Mirror each manifest path from input_dir into output_dir, preserving relative structure.
 
     Example::
 
-        input:  /data/results/batch_001/corpus_a/manifest_0.jsonl
-        input:  /data/results/batch_002/corpus_b/manifest_1.jsonl
+        input_dir:  /data/results_large_scale_6
+        input:      /data/results_large_scale_6/corpus_a/manifest_0.jsonl
         output_dir: /out
-        →  /out/batch_001/corpus_a/manifest_0.jsonl
-           /out/batch_002/corpus_b/manifest_1.jsonl
+        →           /out/corpus_a/manifest_0.jsonl
     """
-    if not manifest_paths:
-        return {}
-    paths = [Path(p) for p in manifest_paths]
-    common = Path(os.path.commonpath([str(p) for p in paths]))
-    # If common path is a file (single manifest), use its parent as anchor
-    if common.is_file() or common.suffix:
-        common = common.parent
-    result: dict[str, str] = {}
-    for p in paths:
-        rel = p.relative_to(common)
-        result[str(p)] = str(Path(output_dir) / rel)
-    return result
+    root = Path(input_dir)
+    return {str(p): str(Path(output_dir) / Path(p).relative_to(root)) for p in manifest_paths}
 
 
 def _create_pipeline(manifest_path: str, output_path: str, args: argparse.Namespace) -> Pipeline:
@@ -107,6 +94,8 @@ def _create_pipeline(manifest_path: str, output_path: str, args: argparse.Namesp
             unique_words_threshold=args.unique_words_threshold,
             long_word_threshold=args.long_word_threshold,
             long_word_rel_threshold=args.long_word_rel_threshold,
+            char_rate_threshold=args.char_rate_threshold,
+            max_char_rate=args.max_char_rate,
         )
     )
     pipeline.add_stage(
@@ -117,7 +106,6 @@ def _create_pipeline(manifest_path: str, output_path: str, args: argparse.Namesp
         )
     )
     pipeline.add_stage(FinalizeFieldsStage())
-    pipeline.add_stage(PreserveByValueStage(input_value_key="skip_me", target_value=0, operator="eq"))
     pipeline.add_stage(ALMManifestWriterStage(output_path=output_path))
     return pipeline
 
@@ -126,12 +114,13 @@ def main(args: argparse.Namespace) -> None:
     logger.remove()
     logger.add(sys.stderr, level="DEBUG" if args.verbose else "INFO")
 
-    with open(args.input_config, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-    manifest_paths = [entry["manifest_filepath"] for entry in cfg["input_cfg"]]
-    logger.info(f"Found {len(manifest_paths)} manifests in {args.input_config}")
+    manifest_paths = _find_manifests(args.input_dir)
+    if not manifest_paths:
+        logger.error(f"No *.jsonl files found under {args.input_dir}")
+        sys.exit(1)
+    logger.info(f"Found {len(manifest_paths)} manifest(s) under {args.input_dir}")
 
-    output_map = _compute_output_paths(manifest_paths, args.output_dir)
+    output_map = _compute_output_paths(manifest_paths, args.input_dir, args.output_dir)
     for src, dst in output_map.items():
         logger.info(f"  {src}")
         logger.info(f"  → {dst}")
@@ -155,10 +144,10 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--input_config",
+        "--input_dir",
         type=str,
         required=True,
-        help="Path to YAML with input_cfg list (each entry must have a manifest_filepath key).",
+        help="Root input directory. All *.jsonl manifests found recursively will be processed.",
     )
     parser.add_argument(
         "--output_dir",
@@ -213,6 +202,18 @@ if __name__ == "__main__":
         type=float,
         default=3.0,
         help="Relative length ratio (longest/second-longest) for long-word hallucination detection.",
+    )
+    parser.add_argument(
+        "--char_rate_threshold",
+        type=float,
+        default=4.0,
+        help="Max chars/s below which text is considered too sparse (low char-rate hallucination).",
+    )
+    parser.add_argument(
+        "--max_char_rate",
+        type=float,
+        default=40.0,
+        help="Min chars/s above which text is considered impossibly dense (high char-rate hallucination).",
     )
     parser.add_argument(
         "--verbose",

@@ -26,10 +26,13 @@ from nemo_curator.tasks import AudioTask
 class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
     """Detect common Whisper hallucination patterns and flag entries with skip_me=1.
 
-    Three checks are applied:
+    Five checks are applied:
     - Repeated n-grams: low lexical diversity (unique-word ratio <= threshold).
     - Long word: an abnormally long word or a word much longer than its neighbours.
     - Frequent single phrase: the full transcript matches a known hallucination phrase.
+    - Low char rate: word-chars / duration <= char_rate_threshold (sparse text over long audio).
+    - High char rate: word-chars / duration > max_char_rate (impossible speech rate; short audio
+      with dense confabulated text, e.g. Whisper generating a full sentence over 0.1 s).
 
     If any check triggers, ``skip_me`` is set to 1 (existing value of 1 is preserved).
     No intermediate flag fields are added to the task.
@@ -39,6 +42,9 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
     unique_words_threshold: float = 0.4
     long_word_threshold: int = 25
     long_word_rel_threshold: float = 3.0
+    char_rate_threshold: float = 4.0
+    max_char_rate: float = 40.0
+    duration_key: str = "duration"
     text_key: str = "cleaned_text"
     skip_me_key: str = "skip_me"
     name: str = "WhisperHallucination"
@@ -46,6 +52,8 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
 
     _phrases: set[str] = field(default_factory=set, init=False, repr=False)
     _setup_called: bool = field(default=False, init=False, repr=False)
+    _n_processed: int = field(default=0, init=False, repr=False)
+    _n_flagged: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.common_hall_file:
@@ -53,28 +61,14 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
             raise ValueError(msg)
 
     def setup(self, worker_metadata: Any = None) -> None:
-        phrases: set[str] = set()
         with open(self.common_hall_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                # Strip trailing frequency count (integer, possibly negative)
-                parts = line.rsplit(" ", 1)
-                if len(parts) == 2:
-                    try:
-                        int(parts[1])
-                        phrases.add(parts[0])
-                    except ValueError:
-                        phrases.add(line)
-                else:
-                    phrases.add(line)
+            phrases = {line.strip() for line in f if line.strip()}
         self._phrases = phrases
         self._setup_called = True
         logger.info(f"WhisperHallucinationStage: loaded {len(phrases)} phrases from {self.common_hall_file}")
 
     def inputs(self) -> tuple[list[str], list[str]]:
-        return [], [self.text_key, self.skip_me_key]
+        return [], [self.text_key, self.skip_me_key, self.duration_key]
 
     def outputs(self) -> tuple[list[str], list[str]]:
         return [], [self.skip_me_key]
@@ -94,9 +88,29 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
             return (lengths[-1] - lengths[-2]) / lengths[-2] >= self.long_word_rel_threshold
         return False
 
+    # Phrases shorter than this are matched exactly; longer ones also match as prefixes.
+    _PREFIX_MATCH_MIN_LEN: int = 8
+
     def _frequent_single_word(self, text: str) -> bool:
-        cleaned = text.strip().rstrip(".,?!")
-        return cleaned in self._phrases
+        cleaned = text.strip().replace(".", "").replace("?", "").replace("!", "")
+        if cleaned in self._phrases:
+            return True
+        return any(
+            len(phrase) >= self._PREFIX_MATCH_MIN_LEN and cleaned.startswith(phrase)
+            for phrase in self._phrases
+        )
+
+    def _low_char_rate(self, words: list[str], duration: float) -> bool:
+        if duration <= 0:
+            return False
+        chars = sum(len(w) for w in words)
+        return chars / duration <= self.char_rate_threshold
+
+    def _high_char_rate(self, words: list[str], duration: float) -> bool:
+        if duration <= 0:
+            return False
+        chars = sum(len(w) for w in words)
+        return chars / duration > self.max_char_rate
 
     def process(self, task: AudioTask) -> AudioTask:
         if not self._setup_called:
@@ -109,7 +123,35 @@ class WhisperHallucinationStage(ProcessingStage[AudioTask, AudioTask]):
         if not isinstance(text, str):
             return task
         words = text.split()
-        flagged = self._repeated_ngrams(words) or self._long_word(words) or self._frequent_single_word(text)
-        if flagged:
+        duration = task.data.get(self.duration_key, 0.0) or 0.0
+
+        repeated = self._repeated_ngrams(words)
+        long_w = self._long_word(words)
+        phrase = self._frequent_single_word(text)
+        low_rate = self._low_char_rate(words, duration)
+        high_rate = self._high_char_rate(words, duration)
+
+        self._n_processed += 1
+        if repeated or long_w or phrase or low_rate or high_rate:
+            self._n_flagged += 1
+            reasons = [
+                name
+                for name, hit in [
+                    ("repeated_ngrams", repeated),
+                    ("long_word", long_w),
+                    ("phrase_match", phrase),
+                    ("low_char_rate", low_rate),
+                    ("high_char_rate", high_rate),
+                ]
+                if hit
+            ]
+            logger.debug(
+                f"[{self.name}] flagged ({','.join(reasons)}) dur={duration:.2f}s: {text[:80]!r}"
+            )
             task.data[self.skip_me_key] = 1
         return task
+
+    def teardown(self) -> None:
+        logger.info(
+            f"[{self.name}] done — processed={self._n_processed}, flagged={self._n_flagged}"
+        )
