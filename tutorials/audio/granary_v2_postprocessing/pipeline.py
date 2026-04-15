@@ -36,6 +36,7 @@ Usage::
 """
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -114,11 +115,15 @@ def main(args: argparse.Namespace) -> None:
     logger.remove()
     logger.add(sys.stderr, level="DEBUG" if args.verbose else "INFO")
 
-    manifest_paths = _find_manifests(args.input_dir)
-    if not manifest_paths:
-        logger.error(f"No *.jsonl files found under {args.input_dir}")
-        sys.exit(1)
-    logger.info(f"Found {len(manifest_paths)} manifest(s) under {args.input_dir}")
+    if args.manifest:
+        manifest_paths = [args.manifest]
+        logger.info(f"Single manifest: {args.manifest}")
+    else:
+        manifest_paths = _find_manifests(args.input_dir)
+        if not manifest_paths:
+            logger.error(f"No *.jsonl files found under {args.input_dir}")
+            sys.exit(1)
+        logger.info(f"Found {len(manifest_paths)} manifest(s) under {args.input_dir}")
 
     output_map = _compute_output_paths(manifest_paths, args.input_dir, args.output_dir)
     for src, dst in output_map.items():
@@ -127,15 +132,38 @@ def main(args: argparse.Namespace) -> None:
 
     executor = XennaExecutor()
 
+    n_done = n_skipped = 0
     for i, (manifest_path, output_path) in enumerate(output_map.items(), 1):
-        logger.info(f"\n[{i}/{len(output_map)}] Processing {manifest_path}")
-        pipeline = _create_pipeline(manifest_path, output_path, args)
+        logger.info(f"\n[{i}/{len(output_map)}] {manifest_path}")
+
+        # Skip manifests whose output already exists and is non-empty.
+        # This makes reruns safe: preempted or partially-run jobs can be
+        # resubmitted and only the missing manifests will be processed.
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            logger.info(f"  Already done, skipping → {output_path}")
+            n_skipped += 1
+            continue
+
+        # Write to a .tmp file first, then rename atomically on success.
+        # A preempted run leaves only the .tmp file, which is ignored on
+        # the next run (not a valid .jsonl), so the manifest is reprocessed.
+        tmp_path = output_path + ".tmp"
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        pipeline = _create_pipeline(manifest_path, tmp_path, args)
         if args.verbose:
             logger.debug(pipeline.describe())
         pipeline.run(executor)
+        os.rename(tmp_path, output_path)
         logger.info(f"  Written → {output_path}")
+        n_done += 1
 
-    logger.info(f"\nDone. {len(output_map)} manifest(s) written to {args.output_dir}")
+    logger.info(
+        f"\nDone. processed={n_done}, skipped={n_skipped} "
+        f"(total={len(output_map)}) → {args.output_dir}"
+    )
 
 
 if __name__ == "__main__":
@@ -147,7 +175,14 @@ if __name__ == "__main__":
         "--input_dir",
         type=str,
         required=True,
-        help="Root input directory. All *.jsonl manifests found recursively will be processed.",
+        help="Root input directory used to compute mirrored output paths.",
+    )
+    parser.add_argument(
+        "--manifest",
+        type=str,
+        default=None,
+        help="Process a single specific manifest instead of scanning all of input_dir. "
+             "Must be under input_dir so the output path can be computed correctly.",
     )
     parser.add_argument(
         "--output_dir",

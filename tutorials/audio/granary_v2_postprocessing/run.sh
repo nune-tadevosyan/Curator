@@ -16,8 +16,10 @@ set -euo pipefail
 
 CURATOR_DIR="/lustre/fsw/convai_convaird_nemo-speech/users/ntadevosyan/projects/granary-v2-asr/Curator"
 FASTTEXT_MODEL="/lustre/fsw/convai_convaird_nemo-speech/users/ntadevosyan/projects/granary-v2-asr/postprocess/fleurs/cache/lid.176.ftz"
-INPUT_DIR="${1:?Usage: sbatch run.sh <input_dir> <output_dir>}"
+INPUT_DIR="${1:?Usage: sbatch run.sh <input_dir> <output_dir> [extra pipeline args]}"
 OUTPUT_DIR="${2:?}"
+shift 2
+EXTRA_ARGS=("$@")   # e.g. --manifest /path/to/shard_0.jsonl
 
 echo "Input dir    : ${INPUT_DIR}"
 echo "Output dir   : ${OUTPUT_DIR}"
@@ -30,6 +32,7 @@ cd "${CURATOR_DIR}"
 python tutorials/audio/granary_v2_postprocessing/pipeline.py \
     --input_dir "${INPUT_DIR}" \
     --output_dir "${OUTPUT_DIR}" \
-    --fasttext_model "${FASTTEXT_MODEL}"
+    --fasttext_model "${FASTTEXT_MODEL}" \
+    "${EXTRA_ARGS[@]}"
 
 echo "Finished : $(date)"
