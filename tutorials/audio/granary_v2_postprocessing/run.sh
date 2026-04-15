@@ -4,7 +4,7 @@
 #SBATCH --job-name=granary-v2-postprocess
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=64
 #SBATCH --mem=128GB
 #SBATCH -t 4:00:00
 #SBATCH --output=/lustre/fsw/convai_convaird_nemo-speech/users/ntadevosyan/projects/granary-v2-asr/Curator/logs/%j_postprocess.out

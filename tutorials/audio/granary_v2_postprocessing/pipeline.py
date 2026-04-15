@@ -115,9 +115,9 @@ def main(args: argparse.Namespace) -> None:
     logger.remove()
     logger.add(sys.stderr, level="DEBUG" if args.verbose else "INFO")
 
-    if args.manifest:
-        manifest_paths = [args.manifest]
-        logger.info(f"Single manifest: {args.manifest}")
+    if args.manifests:
+        manifest_paths = args.manifests
+        logger.info(f"Processing {len(manifest_paths)} specified manifest(s)")
     else:
         manifest_paths = _find_manifests(args.input_dir)
         if not manifest_paths:
@@ -178,11 +178,12 @@ if __name__ == "__main__":
         help="Root input directory used to compute mirrored output paths.",
     )
     parser.add_argument(
-        "--manifest",
+        "--manifests",
         type=str,
+        nargs="+",
         default=None,
-        help="Process a single specific manifest instead of scanning all of input_dir. "
-             "Must be under input_dir so the output path can be computed correctly.",
+        help="Process specific manifests instead of scanning all of input_dir. "
+             "All paths must be under input_dir so output paths can be computed correctly.",
     )
     parser.add_argument(
         "--output_dir",
