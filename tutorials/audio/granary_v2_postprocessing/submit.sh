@@ -20,8 +20,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUN_SCRIPT="${SCRIPT_DIR}/run.sh"
 
-MANIFESTS_PER_JOB="${MANIFESTS_PER_JOB:-128}"
-CPUS_PER_JOB="${CPUS_PER_JOB:-32}"
+MANIFESTS_PER_JOB="${MANIFESTS_PER_JOB:-8}"
+CPUS_PER_JOB="${CPUS_PER_JOB:-8}"
 
 # INPUT_ROOT overrides the path-anchor used for output mirroring.
 # Set by submit_benchmarks.sh so that benchmark subdirs (e.g. .../ytc) still

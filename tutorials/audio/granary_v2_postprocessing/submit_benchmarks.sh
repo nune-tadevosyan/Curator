@@ -27,8 +27,8 @@ declare -A BENCHMARK_CHUNKS=(
     ["ytc"]=8
 )
 
-DEFAULT_MANIFESTS_PER_JOB="${DEFAULT_MANIFESTS_PER_JOB:-128}"
-export CPUS_PER_JOB="${CPUS_PER_JOB:-32}"
+DEFAULT_MANIFESTS_PER_JOB="${DEFAULT_MANIFESTS_PER_JOB:-8}"
+export CPUS_PER_JOB="${CPUS_PER_JOB:-16}"
 
 # --------------------------------------------------------------------------
 
@@ -52,6 +52,28 @@ for BENCH_DIR in "${BENCH_DIRS[@]}"; do
         CHUNKS="${BENCHMARK_CHUNKS[${BENCH_NAME}]}"
     else
         CHUNKS="${DEFAULT_MANIFESTS_PER_JOB}"
+    fi
+
+    # Check if every manifest in this benchmark already has a non-empty output.
+    # If so, skip the benchmark entirely — no jobs submitted.
+    bench_done=$(python3 - "${INPUT_DIR}" "${OUTPUT_DIR}" "${BENCH_DIR}" <<'PYEOF'
+import sys, os
+from pathlib import Path
+input_dir, output_dir, bench_dir = sys.argv[1], sys.argv[2], sys.argv[3]
+manifests = list(Path(bench_dir).rglob("*.jsonl"))
+if not manifests:
+    print("no"); sys.exit(0)
+for m in manifests:
+    out = os.path.join(output_dir, os.path.relpath(str(m), input_dir))
+    if not os.path.isfile(out) or os.path.getsize(out) == 0:
+        print("no"); sys.exit(0)
+print("yes")
+PYEOF
+)
+
+    if [[ "${bench_done}" == "yes" ]]; then
+        echo ">>> ${BENCH_NAME}  — already done, skipping"
+        continue
     fi
 
     echo ">>> ${BENCH_NAME}  (MANIFESTS_PER_JOB=${CHUNKS})"
