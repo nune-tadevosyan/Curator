@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import copy
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from loguru import logger
@@ -70,6 +70,17 @@ class RayDataStageAdapter(BaseStageAdapter):
         # Return the results as Ray Data expects them
         # For Task objects, we return them in the 'item' column
         return {"item": results}
+
+    def _process_stream_internal(self, batch: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Internal method that emits one output block per chunk the stage yields.
+
+        Ray Data treats a generator UDF as a stream of blocks, so downstream operators
+        start on the first chunk instead of waiting for the whole batch to be processed.
+        """
+        for results in self.process_stream(batch["item"]):
+            # Ray Data rejects blocks with no rows, and an empty chunk carries no work.
+            if len(results) > 0:
+                yield {"item": results}
 
     def process_dataset(self, dataset: Dataset, ignore_head_node: bool = False) -> Dataset:
         """Process a Ray Data dataset through this stage.
@@ -139,12 +150,24 @@ def create_actor_from_stage(stage: ProcessingStage) -> type[RayDataStageAdapter]
         def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
             return self._process_batch_internal(batch)
 
+    class RayDataStreamingStageActorAdapter(RayDataStageActorAdapter):
+        """Actor variant for stages that emit their output incrementally.
+
+        ``__call__`` is a generator function so Ray Data consumes it as a stream of
+        blocks rather than a single block.
+        """
+
+        def __call__(self, batch: dict[str, Any]) -> Iterator[dict[str, Any]]:
+            yield from self._process_stream_internal(batch)
+
+    adapter_cls = RayDataStreamingStageActorAdapter if stage.supports_streaming() else RayDataStageActorAdapter
+
     # Set the class name to match the stage name
     stage_name = stage.__class__.__name__ + "Actor"
-    RayDataStageActorAdapter.__name__ = stage_name
-    RayDataStageActorAdapter.__qualname__ = stage_name
+    adapter_cls.__name__ = stage_name
+    adapter_cls.__qualname__ = stage_name
 
-    return RayDataStageActorAdapter
+    return adapter_cls
 
 
 def create_task_from_stage(stage: ProcessingStage) -> Callable[[dict[str, Any]], dict[str, Any]]:
@@ -163,9 +186,17 @@ def create_task_from_stage(stage: ProcessingStage) -> Callable[[dict[str, Any]],
     adapter = RayDataStageAdapter(stage)
 
     # Create a standalone function that wraps the adapter's processing logic
-    def stage_map_fn(batch: dict[str, Any]) -> dict[str, Any]:
-        """Dynamically named map function that processes a batch of Task objects."""
-        return adapter._process_batch_internal(batch)
+    if stage.supports_streaming():
+        # A generator function makes Ray Data emit one block per yielded chunk.
+        def stage_map_fn(batch: dict[str, Any]) -> Iterator[dict[str, Any]]:
+            """Dynamically named map function that streams batches of Task objects."""
+            yield from adapter._process_stream_internal(batch)
+
+    else:
+
+        def stage_map_fn(batch: dict[str, Any]) -> dict[str, Any]:
+            """Dynamically named map function that processes a batch of Task objects."""
+            return adapter._process_batch_internal(batch)
 
     # Set the function name to include the stage name with Task suffix
     stage_name = stage.__class__.__name__ + "Task"

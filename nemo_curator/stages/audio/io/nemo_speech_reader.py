@@ -29,6 +29,8 @@ Decomposes into:
 from __future__ import annotations
 
 import os
+import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +61,29 @@ _TARGET_SR = 16000
 # Preferred source format when the same recording appears under multiple extensions
 # (lower rank = kept). Anything unlisted ranks last.
 _FORMAT_PRIORITY = {".opus": 0, ".wav": 1, ".flac": 2, ".ogg": 3, ".m4a": 4, ".mp3": 5}
+
+# NeMo tarred manifests describe offset sub-segments as separate entries whose
+# audio_filepath carries a ``-subN`` suffix; they all resolve to one tar member.
+# Mirrors the pattern in NeMo's LazyNeMoTarredIterator.
+_OFFSET_SUB_PATTERN = re.compile(r"^(?P<stem>.+)(?P<sub>-sub\d+)(?P<ext>\.\w+)?$")
+
+
+def _tar_member_name(audio_filepath: str) -> str:
+    """Map a manifest ``audio_filepath`` to the tar member that holds its audio."""
+    match = _OFFSET_SUB_PATTERN.match(audio_filepath)
+    if match is None:
+        return audio_filepath
+    return match.group("stem") + (match.group("ext") or "")
+
+
+def _read_manifest_entries(manifest_path: str) -> list[dict]:
+    """Read a NeMo JSONL manifest (plain or gzipped, local or object storage)."""
+    import json
+
+    import fsspec
+
+    with fsspec.open(manifest_path, "rt", encoding="utf-8", compression="infer") as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def _dedup_entries_by_stem(entries: list[dict], shard_key: str) -> list[dict]:
@@ -401,10 +426,20 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     latency. This significantly speeds up reading large files from object
     storage.
 
+    Tarred shards are emitted incrementally: a shard is walked once (the tar is a
+    forward-only stream) and AudioTasks are handed downstream every
+    ``emit_chunk_size`` utterances, so a large shard no longer has to fit in memory
+    before the next stage can start.
+
     Args:
         max_io_threads: Maximum number of concurrent I/O threads for
             loading audio files in ``process_batch``. Only applies to
             single-entry (non-tarred) tasks. Defaults to 8.
+        emit_chunk_size: Number of decoded utterances to accumulate before handing
+            a chunk to the next stage. Bounds how many waveforms the reader holds
+            at once for a tarred shard. Larger values amortize per-chunk overhead;
+            smaller values lower peak memory and start the next stage sooner.
+            Defaults to 32.
         max_audio_duration_sec: Maximum source-audio duration to process.
             Recordings longer than this are emitted as ``read_error`` audit
             rows with ``audio_too_long=True`` rather than being decoded.
@@ -423,6 +458,7 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
     # Max shards read in parallel. Caps in-flight waveforms so the object store
     # doesn't overflow (without it, Ray launches up to one reader task per CPU).
     read_concurrency: int = 2
+    emit_chunk_size: int = 32
     max_audio_duration_sec: float | None = 12 * 60 * 60
     resampled_output_dir: str | None = None
     resampled_subtype: str = "FLOAT"
@@ -876,8 +912,93 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
 
         return entry_data
 
-    def _process_cutset(self, task: FileGroupTask) -> list[AudioTask]:
-        """Load all cuts from a manifest/tar shard and return AudioTasks."""
+    def _expected_entries_by_member(self, manifest_path: str) -> dict[str, list[dict]] | None:
+        """Group a shard's manifest entries by tar member, or None if it can't be read.
+
+        Reading the manifest up front (text only, no audio) is what makes the shard total
+        known before any audio is decoded, which in turn lets the shard be emitted in
+        chunks. Entries flagged ``_skipme`` are excluded because NeMo's adapter never
+        yields cuts for them, so they must not count toward the total.
+
+        Returns None for manifests fsspec cannot open (e.g. ``pipe:`` specifiers), in
+        which case the caller falls back to buffering the whole shard.
+        """
+        try:
+            entries = _read_manifest_entries(manifest_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Could not pre-read manifest {manifest_path} ({exc}); "
+                "falling back to buffering the whole shard in memory"
+            )
+            return None
+
+        by_member: dict[str, list[dict]] = {}
+        for entry in entries:
+            if entry.get("_skipme", False):
+                continue
+            by_member.setdefault(_tar_member_name(entry.get("audio_filepath", "")), []).append(entry)
+        for group in by_member.values():
+            # Match the order in which NeMo's adapter yields a member's sub-segments.
+            group.sort(key=lambda e: e.get("audio_filepath", ""))
+        return by_member
+
+    def _missing_entry_tasks(
+        self,
+        task: FileGroupTask,
+        expected: dict[str, list[dict]],
+        emitted_per_member: dict[str, int],
+        shard_total: int,
+        emitted_total: int,
+    ) -> list[AudioTask]:
+        """Build ``read_error`` placeholders for manifest entries that produced no cut.
+
+        NeMo's adapter silently skips tar members that are missing or undecodable. Without
+        placeholders the writer's row count would never reach ``_shard_total``, so the
+        shard's ``.done`` marker would never be written and every resume would redo it.
+
+        The number of placeholders is capped at the shortfall so the emitted row count
+        matches ``shard_total`` exactly even if member names don't line up with the
+        manifest's ``audio_filepath`` values.
+        """
+        shortfall = shard_total - emitted_total
+        if shortfall <= 0:
+            return []
+
+        shard_key = task.reader_config.get("shard_key", task.task_id)
+        placeholders: list[AudioTask] = []
+        for member, entries in expected.items():
+            for entry in entries[emitted_per_member.get(member, 0) :]:
+                audio_filepath = entry.get("audio_filepath", member)
+                placeholders.append(
+                    self._read_error_task(
+                        FileGroupTask(
+                            task_id=f"{shard_key}_{audio_filepath}",
+                            dataset_name=task.dataset_name,
+                            data=[audio_filepath],
+                            reader_config={**task.reader_config, "entry": entry, "shard_total": shard_total},
+                            _metadata=dict(task._metadata),
+                        )
+                    )
+                )
+                if len(placeholders) == shortfall:
+                    break
+            if len(placeholders) == shortfall:
+                break
+
+        logger.warning(
+            f"Shard {shard_key}: {len(placeholders)} manifest entry(ies) yielded no audio "
+            "(missing or corrupt in the tar); emitting read_error rows so the shard can complete"
+        )
+        return placeholders
+
+    def _stream_cutset(self, task: FileGroupTask) -> Iterator[list[AudioTask]]:
+        """Read a manifest/tar shard, yielding AudioTasks in ``emit_chunk_size`` chunks.
+
+        The tar can only be read as a forward-only stream, so the shard is walked exactly
+        once. Decoded waveforms are released after each chunk is yielded, so reader memory
+        scales with ``emit_chunk_size`` instead of the shard's utterance count, and the
+        next stage can start before the shard finishes.
+        """
         corpus = task.reader_config.get("corpus", "unknown")
         shard_key = task.reader_config.get("shard_key", task.task_id)
         language = task.reader_config.get("language", "")
@@ -886,13 +1007,21 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
         manifest_path = task.data[0]
         tar_path = task.data[1] if len(task.data) >= 2 else None  # noqa: PLR2004
 
+        expected = self._expected_entries_by_member(manifest_path)
+        # Without a readable manifest the total is only known once every cut has been
+        # read, so the shard has to be buffered and emitted as one chunk at the end.
+        shard_total = sum(len(entries) for entries in expected.values()) if expected is not None else 0
         mode = "tarred" if tar_path else "non-tarred"
-        logger.info(f"Reading shard {shard_key} via NeMo {mode} adapter")
+        logger.info(
+            f"Reading shard {shard_key} via NeMo {mode} adapter "
+            f"({shard_total if expected is not None else 'unknown'} entries, "
+            f"chunk={self.emit_chunk_size if expected is not None else 'whole shard'})"
+        )
 
-        results: list[AudioTask] = []
-        cutset = self._make_cutset(manifest_path, tar_path)
+        chunk: list[AudioTask] = []
+        emitted_per_member: dict[str, int] = {}
         loaded = 0
-        for cut in cutset:
+        for cut in self._make_cutset(manifest_path, tar_path):
             try:
                 entry_data = self._build_cut_entry(cut, corpus, language)
             except Exception:  # noqa: BLE001
@@ -903,20 +1032,57 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             if loaded % 100 == 0 or loaded == 1:
                 logger.info(f"  [{shard_key}] loaded {loaded}")
 
-            results.append(
+            member = getattr(cut, "recording_id", None) or cut.id
+            emitted_per_member[member] = emitted_per_member.get(member, 0) + 1
+            chunk.append(
                 AudioTask(
                     task_id=f"{shard_key}_{cut.id}",
                     dataset_name=corpus,
                     data=entry_data,
-                    _metadata={**metadata, "_shard_key": shard_key},
+                    _metadata={**metadata, "_shard_key": shard_key, "_shard_total": shard_total},
                     _stage_perf=list(task._stage_perf),
                 )
             )
 
-        for r in results:
-            r._metadata["_shard_total"] = len(results)
+            if expected is not None and len(chunk) >= self.emit_chunk_size:
+                yield chunk
+                chunk = []
 
-        logger.info(f"Shard {shard_key}: emitted {len(results)} AudioTasks")
+        if expected is not None:
+            chunk.extend(self._missing_entry_tasks(task, expected, emitted_per_member, shard_total, loaded))
+        else:
+            for audio_task in chunk:
+                audio_task._metadata["_shard_total"] = len(chunk)
+
+        logger.info(f"Shard {shard_key}: read {loaded} cuts")
+        if chunk:
+            yield chunk
+
+    def _process_cutset(self, task: FileGroupTask) -> list[AudioTask]:
+        """Load all cuts from a manifest/tar shard and return AudioTasks."""
+        return [audio_task for chunk in self._stream_cutset(task) for audio_task in chunk]
+
+    def _load_single_entries(self, tasks: list[FileGroupTask]) -> list[AudioTask]:
+        """Load one audio file per task, overlapping S3/network latency across threads."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        n_threads = min(self.max_io_threads, len(tasks))
+        logger.info(f"NeMoSpeechReader: loading {len(tasks)} audio files with {n_threads} I/O threads")
+
+        results: list[AudioTask] = []
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            future_to_task = {pool.submit(self._process_single_entry, t): t for t in tasks}
+            for future in as_completed(future_to_task):
+                src_task = future_to_task[future]
+                try:
+                    results.extend(future.result())
+                except Exception as exc:  # noqa: BLE001
+                    # Emit a placeholder so the shard can still complete instead of
+                    # stalling forever on a deterministically-failing input.
+                    logger.warning(
+                        f"Failed to load audio for task {src_task.task_id}, emitting read-error placeholder: {exc}"
+                    )
+                    results.append(self._read_error_task(src_task))
         return results
 
     def process(self, task: FileGroupTask) -> list[AudioTask]:
@@ -924,10 +1090,8 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             return self._process_single_entry(task)
         return self._process_cutset(task)
 
-    def process_batch(self, tasks: list[FileGroupTask]) -> list[AudioTask]:
-        if len(tasks) <= 1:
-            return [at for task in tasks for at in self.process(task)]
-
+    def process_stream(self, tasks: list[FileGroupTask]) -> Iterator[list[AudioTask]]:
+        """Yield AudioTasks in chunks so the next stage starts before a shard is fully read."""
         single_entry_tasks: list[FileGroupTask] = []
         other_tasks: list[FileGroupTask] = []
         for task in tasks:
@@ -936,34 +1100,15 @@ class NeMoSpeechReaderStage(ProcessingStage[FileGroupTask, AudioTask]):
             else:
                 other_tasks.append(task)
 
-        results: list[AudioTask] = []
-
         if single_entry_tasks:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-
-            n_threads = min(self.max_io_threads, len(single_entry_tasks))
-            logger.info(
-                f"NeMoSpeechReader: loading {len(single_entry_tasks)} audio files with {n_threads} I/O threads"
-            )
-            with ThreadPoolExecutor(max_workers=n_threads) as pool:
-                future_to_task = {pool.submit(self._process_single_entry, t): t for t in single_entry_tasks}
-                for future in as_completed(future_to_task):
-                    src_task = future_to_task[future]
-                    try:
-                        results.extend(future.result())
-                    except Exception as exc:  # noqa: BLE001
-                        # Emit a placeholder so the shard can still complete instead of
-                        # stalling forever on a deterministically-failing input.
-                        logger.warning(
-                            f"Failed to load audio for task {src_task.task_id}, emitting read-error placeholder: {exc}"
-                        )
-                        if src_task.reader_config.get("entry") is not None:
-                            results.append(self._read_error_task(src_task))
+            # One task per file already, so the incoming batch size bounds memory here.
+            yield self._load_single_entries(single_entry_tasks)
 
         for task in other_tasks:
-            results.extend(self._process_cutset(task))
+            yield from self._stream_cutset(task)
 
-        return results
+    def process_batch(self, tasks: list[FileGroupTask]) -> list[AudioTask]:
+        return [audio_task for chunk in self.process_stream(tasks) for audio_task in chunk]
 
 
 # ---------------------------------------------------------------------------
@@ -989,6 +1134,9 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
         max_io_threads: Maximum concurrent threads for loading audio
             from S3/object storage. Higher values overlap more network
             latency but use more memory. Defaults to 8.
+        emit_chunk_size: Number of decoded utterances the reader accumulates before
+            handing them to the next stage. Caps the reader's in-flight waveforms per
+            tarred shard, so shard size no longer drives peak memory. Defaults to 32.
         max_audio_duration_sec: Maximum source-audio duration to process.
             Longer recordings become ``read_error`` audit rows marked
             ``audio_too_long``. Defaults to 12 hours; 0 or ``None`` disables
@@ -1009,6 +1157,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
     output_dir: str | None = None
     max_io_threads: int = 8
     read_concurrency: int = 2
+    emit_chunk_size: int = 32
     max_audio_duration_sec: float | None = 12 * 60 * 60
     resampled_output_dir: str | None = None
     resampled_subtype: str = "FLOAT"
@@ -1030,6 +1179,7 @@ class NeMoSpeechAudioReader(CompositeStage[_EmptyTask, AudioTask]):
             NeMoSpeechReaderStage(
                 max_io_threads=self.max_io_threads,
                 read_concurrency=self.read_concurrency,
+                emit_chunk_size=self.emit_chunk_size,
                 max_audio_duration_sec=self.max_audio_duration_sec,
                 resampled_output_dir=self.resampled_output_dir,
                 resampled_subtype=self.resampled_subtype,

@@ -14,6 +14,7 @@
 
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -97,6 +98,43 @@ class BaseStageAdapter:
             task.add_stage_perf(stage_perf_stats)
 
         return results
+
+    def process_stream(self, tasks: list[Task]) -> Iterator[list[Task]]:
+        """Process a batch of tasks, yielding each chunk as the stage produces it.
+
+        Each chunk is timed separately, so a stage that emits incrementally reports
+        per-chunk stats instead of one stat covering the whole batch.
+
+        Args:
+            tasks (list[Task]): List of tasks to process
+
+        Yields:
+            list[Task]: Chunks of processed tasks
+        """
+        if not hasattr(self, "_timer") or self._timer is None:
+            self._timer = StageTimer(self.stage)
+
+        input_size = sum(task.num_items for task in tasks)
+        stream = self.stage.process_stream(tasks)
+        exhausted = object()
+
+        while True:
+            self._timer.reinit(input_size)
+            with self._timer.time_process(input_size):
+                # A sentinel keeps StopIteration from being raised inside the timer's
+                # context manager, where it would surface as a RuntimeError (PEP 479).
+                results = next(stream, exhausted)
+            if results is exhausted:
+                return
+
+            _, stage_perf_stats = self._timer.log_stats()
+            custom_metrics = self.stage._consume_custom_metrics()
+            if custom_metrics:
+                stage_perf_stats.custom_metrics.update(custom_metrics)
+            for task in results:
+                task.add_stage_perf(stage_perf_stats)
+
+            yield results
 
     def setup_on_node(self, node_info: NodeInfo | None = None, worker_metadata: WorkerMetadata | None = None) -> None:
         """Setup the stage on a node.

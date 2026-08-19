@@ -18,6 +18,7 @@ import contextlib
 import copy
 import time
 from abc import ABC, ABCMeta, abstractmethod
+from collections.abc import Iterator
 from inspect import isabstract
 from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar, final
 
@@ -197,6 +198,31 @@ class ProcessingStage(ABC, Generic[X, Y], metaclass=StageMeta):
             else:
                 results.append(result)
         return results
+
+    def process_stream(self, tasks: list[X]) -> Iterator[list[Y]]:
+        """Process a batch of tasks, yielding results in chunks as they become available.
+
+        Override this for stages whose output for a single input task is too large to hold
+        in memory at once (e.g. a reader that decodes a whole shard of audio). On backends
+        that support incremental output, the next stage starts on the first yielded chunk
+        instead of waiting for the whole batch, and the stage only holds one chunk at a time.
+
+        Backends without streaming support call ``process_batch`` instead, so an override
+        must yield the same tasks, in the same order, that ``process_batch`` would return.
+
+        Args:
+            tasks (list[X]): List of input tasks to process
+        Yields (list[Y]):
+            Chunks of output tasks. Empty chunks are allowed but are skipped by backends.
+        """
+        yield self.process_batch(tasks)
+
+    def supports_streaming(self) -> bool:
+        """Whether this stage yields its output incrementally.
+        This is automatically determined by checking if the stage has
+        overridden the process_stream method from the base class.
+        """
+        return type(self).process_stream is not ProcessingStage.process_stream
 
     def setup_on_node(self, node_info: NodeInfo | None = None, worker_metadata: WorkerMetadata | None = None) -> None:
         """Setup method called once per node in distributed settings.

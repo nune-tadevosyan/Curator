@@ -14,6 +14,8 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 from typing import ClassVar
 
 import pytest
@@ -21,10 +23,14 @@ import pytest
 from nemo_curator.stages.audio.io.nemo_speech_reader import (
     NeMoSpeechAudioReader,
     NeMoSpeechDiscoveryStage,
+    NeMoSpeechReaderStage,
     _dedup_entries_by_stem,
     _load_input_cfg,
     _parse_input_cfg,
+    _read_manifest_entries,
+    _tar_member_name,
 )
+from nemo_curator.tasks import FileGroupTask
 
 
 class TestDedupEntriesByStem:
@@ -164,3 +170,216 @@ class TestInlineInputCfg:
         discovery = reader.decompose()[0]
         assert isinstance(discovery, NeMoSpeechDiscoveryStage)
         assert discovery.input_cfg == self._INLINE
+
+    def test_emit_chunk_size_reaches_reader_stage(self) -> None:
+        reader = NeMoSpeechAudioReader(input_cfg=self._INLINE, emit_chunk_size=4)
+        assert reader.decompose()[-1].emit_chunk_size == 4
+
+
+class TestTarMemberName:
+    def test_plain_path_is_unchanged(self) -> None:
+        assert _tar_member_name("utt_001.wav") == "utt_001.wav"
+
+    def test_offset_sub_segments_share_one_member(self) -> None:
+        assert _tar_member_name("utt_001-sub1.wav") == "utt_001.wav"
+        assert _tar_member_name("utt_001-sub12.wav") == "utt_001.wav"
+
+    def test_suffix_without_extension(self) -> None:
+        assert _tar_member_name("utt_001-sub3") == "utt_001"
+
+
+class TestReadManifestEntries:
+    def test_reads_plain_jsonl(self, tmp_path) -> None:  # noqa: ANN001
+        path = tmp_path / "m.jsonl"
+        path.write_text('{"audio_filepath": "a.wav"}\n\n{"audio_filepath": "b.wav"}\n', encoding="utf-8")
+        assert _read_manifest_entries(str(path)) == [{"audio_filepath": "a.wav"}, {"audio_filepath": "b.wav"}]
+
+    def test_reads_gzipped_jsonl(self, tmp_path) -> None:  # noqa: ANN001
+        path = tmp_path / "m.jsonl.gz"
+        with gzip.open(path, "wt", encoding="utf-8") as f:
+            f.write('{"audio_filepath": "a.wav"}\n')
+        assert _read_manifest_entries(str(path)) == [{"audio_filepath": "a.wav"}]
+
+
+class _FakeCut:
+    """Minimal stand-in for a lhotse Cut, enough for the reader's shard loop."""
+
+    def __init__(self, cut_id: str, recording_id: str | None = None) -> None:
+        self.id = cut_id
+        self.recording_id = recording_id or cut_id
+
+
+class TestStreamCutset:
+    """The tarred reader emits a shard in chunks instead of buffering all of it.
+
+    The tar is a forward-only stream, so these tests stub the CutSet and the per-cut
+    decode: what matters is the chunking, the shard total, and the audit rows that keep
+    the writer's ``.done`` accounting exact.
+    """
+
+    @staticmethod
+    def _write_manifest(tmp_path, entries: list[dict]) -> str:  # noqa: ANN001
+        path = tmp_path / "manifest_0.jsonl"
+        with open(path, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry) + "\n")
+        return str(path)
+
+    @staticmethod
+    def _stage(monkeypatch: pytest.MonkeyPatch, cuts: list[_FakeCut], **kwargs) -> NeMoSpeechReaderStage:
+        stage = NeMoSpeechReaderStage(**kwargs)
+        monkeypatch.setattr(stage, "_make_cutset", lambda *_args, **_kw: list(cuts))
+        monkeypatch.setattr(
+            stage,
+            "_build_cut_entry",
+            lambda cut, corpus, _language: {"audio_filepath": cut.id, "corpus": corpus},
+        )
+        return stage
+
+    @staticmethod
+    def _task(manifest_path: str) -> FileGroupTask:
+        return FileGroupTask(
+            task_id="shard_0",
+            dataset_name="corp",
+            data=[manifest_path, "/data/audio_0.tar"],
+            reader_config={"corpus": "corp", "shard_key": "corp/shard_0", "language": "en"},
+        )
+
+    def test_yields_chunks_of_emit_chunk_size(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        names = [f"utt_{i}.wav" for i in range(5)]
+        manifest = self._write_manifest(tmp_path, [{"audio_filepath": n} for n in names])
+        stage = self._stage(monkeypatch, [_FakeCut(n) for n in names], emit_chunk_size=2)
+
+        chunks = list(stage._stream_cutset(self._task(manifest)))
+
+        assert [len(c) for c in chunks] == [2, 2, 1]
+
+    def test_shard_total_is_known_on_the_first_chunk(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        # The writer only writes .done once it has seen _shard_total rows, so the very
+        # first emitted task must already carry the full count.
+        names = [f"utt_{i}.wav" for i in range(5)]
+        manifest = self._write_manifest(tmp_path, [{"audio_filepath": n} for n in names])
+        stage = self._stage(monkeypatch, [_FakeCut(n) for n in names], emit_chunk_size=2)
+
+        first_chunk = next(iter(stage._stream_cutset(self._task(manifest))))
+
+        assert all(t._metadata["_shard_total"] == 5 for t in first_chunk)
+        assert all(t._metadata["_shard_key"] == "corp/shard_0" for t in first_chunk)
+
+    def test_emitted_count_matches_shard_total(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        names = [f"utt_{i}.wav" for i in range(5)]
+        manifest = self._write_manifest(tmp_path, [{"audio_filepath": n} for n in names])
+        stage = self._stage(monkeypatch, [_FakeCut(n) for n in names], emit_chunk_size=2)
+
+        tasks = stage._process_cutset(self._task(manifest))
+
+        assert len(tasks) == 5
+        assert [t.data["audio_filepath"] for t in tasks] == names
+
+    def test_missing_tar_members_become_read_error_rows(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        # NeMo's adapter silently skips members absent from (or corrupt in) the tar.
+        # Placeholders keep the row count at _shard_total so .done still fires.
+        names = [f"utt_{i}.wav" for i in range(5)]
+        manifest = self._write_manifest(tmp_path, [{"audio_filepath": n} for n in names])
+        stage = self._stage(monkeypatch, [_FakeCut(n) for n in names[:3]], emit_chunk_size=2)
+
+        tasks = stage._process_cutset(self._task(manifest))
+
+        assert len(tasks) == 5
+        read_errors = [t for t in tasks if t.data.get("read_error")]
+        assert len(read_errors) == 2
+        assert {t.data["audio_filepath"] for t in read_errors} == {"utt_3.wav", "utt_4.wav"}
+
+    def test_skipme_entries_are_excluded_from_shard_total(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        # The adapter never yields cuts for _skipme entries, so counting them would
+        # leave the shard permanently one row short of completion.
+        manifest = self._write_manifest(
+            tmp_path,
+            [
+                {"audio_filepath": "utt_0.wav"},
+                {"audio_filepath": "utt_1.wav", "_skipme": "bad audio"},
+                {"audio_filepath": "utt_2.wav"},
+            ],
+        )
+        stage = self._stage(monkeypatch, [_FakeCut("utt_0.wav"), _FakeCut("utt_2.wav")])
+
+        tasks = stage._process_cutset(self._task(manifest))
+
+        assert len(tasks) == 2
+        assert all(t._metadata["_shard_total"] == 2 for t in tasks)
+        assert not any(t.data.get("read_error") for t in tasks)
+
+    def test_offset_sub_segments_do_not_produce_placeholders(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        # Two manifest rows, one tar member: both cuts come from recording "utt_0.wav".
+        manifest = self._write_manifest(
+            tmp_path,
+            [
+                {"audio_filepath": "utt_0-sub1.wav", "offset": 0.0},
+                {"audio_filepath": "utt_0-sub2.wav", "offset": 1.0},
+            ],
+        )
+        cuts = [_FakeCut("utt_0-sub1.wav", recording_id="utt_0.wav"), _FakeCut("utt_0-sub2.wav", "utt_0.wav")]
+        stage = self._stage(monkeypatch, cuts)
+
+        tasks = stage._process_cutset(self._task(manifest))
+
+        assert len(tasks) == 2
+        assert not any(t.data.get("read_error") for t in tasks)
+        assert all(t._metadata["_shard_total"] == 2 for t in tasks)
+
+    def test_undecodable_cut_is_replaced_by_a_read_error_row(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        names = ["utt_0.wav", "utt_1.wav"]
+        manifest = self._write_manifest(tmp_path, [{"audio_filepath": n} for n in names])
+        stage = NeMoSpeechReaderStage()
+        monkeypatch.setattr(stage, "_make_cutset", lambda *_a, **_kw: [_FakeCut(n) for n in names])
+
+        def explode_on_second(cut, corpus, _language):  # noqa: ANN001, ANN202
+            if cut.id == "utt_1.wav":
+                msg = "corrupt audio"
+                raise RuntimeError(msg)
+            return {"audio_filepath": cut.id, "corpus": corpus}
+
+        monkeypatch.setattr(stage, "_build_cut_entry", explode_on_second)
+
+        tasks = stage._process_cutset(self._task(manifest))
+
+        assert len(tasks) == 2
+        assert tasks[1].data["read_error"] is True
+        assert tasks[1].data["audio_filepath"] == "utt_1.wav"
+
+    def test_unreadable_manifest_falls_back_to_buffering_whole_shard(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Without a readable manifest the total is only known after the last cut, so the
+        # shard is emitted as a single chunk with the count observed during the read.
+        names = [f"utt_{i}.wav" for i in range(3)]
+        stage = self._stage(monkeypatch, [_FakeCut(n) for n in names], emit_chunk_size=1)
+
+        chunks = list(stage._stream_cutset(self._task("/nonexistent/manifest_0.jsonl")))
+
+        assert [len(c) for c in chunks] == [3]
+        assert all(t._metadata["_shard_total"] == 3 for t in chunks[0])
+
+
+class TestReaderStreamingContract:
+    """``process_batch`` must stay equivalent to draining ``process_stream``.
+
+    Backends without incremental output (Xenna, Ray actor pool) call ``process_batch``,
+    so the two paths have to produce the same tasks in the same order.
+    """
+
+    def test_reader_declares_streaming_support(self) -> None:
+        assert NeMoSpeechReaderStage().supports_streaming() is True
+
+    def test_non_streaming_stage_does_not_declare_support(self) -> None:
+        assert NeMoSpeechDiscoveryStage(yaml_path="/some/config.yaml").supports_streaming() is False
+
+    def test_process_batch_matches_process_stream(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:  # noqa: ANN001
+        names = [f"utt_{i}.wav" for i in range(5)]
+        manifest = TestStreamCutset._write_manifest(tmp_path, [{"audio_filepath": n} for n in names])
+        stage = TestStreamCutset._stage(monkeypatch, [_FakeCut(n) for n in names], emit_chunk_size=2)
+        task = TestStreamCutset._task(manifest)
+
+        batched = stage.process_batch([task])
+        streamed = [t for chunk in stage.process_stream([task]) for t in chunk]
+
+        assert [t.task_id for t in batched] == [t.task_id for t in streamed]
+        assert len(batched) == 5
